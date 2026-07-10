@@ -1,271 +1,571 @@
-# app.py
 import streamlit as st
 import pandas as pd
+import numpy as np
+import re
 from io import BytesIO
-import zipfile
-from difflib import get_close_matches
+from pathlib import Path
 
-st.set_page_config(page_title="Excel Master File Merger", layout="wide")
-st.title("📊 Smart Excel File Merger")
+st.set_page_config(page_title="Lead/Company File Consolidator", layout="wide")
 
-# Added "zip" to accepted file types
-uploaded_files = st.file_uploader(
-    "Upload Excel files or a ZIP folder", type=["xlsx", "xls", "zip"], accept_multiple_files=True
-)
-
-similarity_threshold = st.slider(
-    "Header matching sensitivity", 0.5, 1.0, 0.7, 0.05
-)
-
-TARGET_KEYWORDS = [
-    "organisation", "company", "account", "country", "segment", 
-    "role", "title", "email", "linkedin", "decision maker", 
-    "contact", "pain point", "signal", "tier", "website", "domain", "location", "address"
+# =========================
+# Config
+# =========================
+MASTER_CORE_HEADERS = [
+    "Decision Maker",
+    "Job Title",
+    "Organisation",
+    "Country",
+    "Segment",
+    "Email",
+    "Website",
+    "Location",
+    "LinkedIn URL",
+    "Source File",
 ]
 
-def normalize(col):
-    return str(col).replace('\n', ' ').strip().lower().replace("_", " ")
+FREE_EMAIL_DOMAINS = {
+    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com",
+    "icloud.com", "live.com", "msn.com", "me.com", "protonmail.com"
+}
 
-# Updated to read bytes directly (needed for zip extraction)
-def extract_clean_table(file_bytes):
-    excel = pd.ExcelFile(file_bytes)
-    best_df = None
-    best_score = -1
-    
-    target_sheet_names = ["Priority Prospects", "Execution", "Sheet1"]
-    sheets_to_check = []
-    
-    for s_name in excel.sheet_names:
-        if any(target.lower() in s_name.lower() for target in target_sheet_names):
-            sheets_to_check.insert(0, s_name)
+EUROPEAN_COUNTRIES = {
+    "uk", "united kingdom", "great britain", "britain", "england", "scotland", "wales", "northern ireland", "gb", "gbr",
+    "ireland", "republic of ireland", "ie",
+    "austria", "belgium", "bulgaria", "croatia", "cyprus", "czech republic", "czechia",
+    "denmark", "estonia", "finland", "france", "germany", "greece", "hungary",
+    "iceland", "italy", "latvia", "liechtenstein", "lithuania", "luxembourg",
+    "malta", "netherlands", "norway", "poland", "portugal", "romania", "slovakia",
+    "slovenia", "spain", "sweden", "switzerland",
+    "belarus", "bosnia and herzegovina", "serbia", "montenegro", "north macedonia",
+    "albania", "andorra", "armenia", "azerbaijan", "georgia", "kosovo", "moldova",
+    "monaco", "san marino", "vatican city", "eu", "europe", "european union"
+}
+
+TLD_TO_COUNTRY = {
+    ".uk": "united kingdom",
+    ".ie": "ireland",
+    ".de": "germany",
+    ".fr": "france",
+    ".nl": "netherlands",
+    ".it": "italy",
+    ".es": "spain",
+    ".se": "sweden",
+    ".no": "norway",
+    ".ch": "switzerland",
+    ".be": "belgium",
+    ".dk": "denmark",
+    ".fi": "finland",
+    ".at": "austria",
+    ".pt": "portugal",
+    ".pl": "poland",
+    ".ro": "romania",
+    ".cz": "czech republic",
+    ".hu": "hungary",
+    ".gr": "greece",
+    ".bg": "bulgaria",
+    ".sk": "slovakia",
+    ".si": "slovenia",
+    ".lv": "latvia",
+    ".lt": "lithuania",
+    ".lu": "luxembourg",
+    ".mt": "malta",
+    ".is": "iceland",
+    ".rs": "serbia",
+    ".me": "montenegro",
+    ".al": "albania",
+    ".ba": "bosnia and herzegovina",
+    ".hr": "croatia",
+    ".ee": "estonia",
+    ".cy": "cyprus",
+    ".eu": "eu",
+    ".ac.uk": "united kingdom",
+    ".gov.uk": "united kingdom",
+    ".org.uk": "united kingdom",
+    ".co.uk": "united kingdom"
+}
+
+# =========================
+# Helpers
+# =========================
+def normalize_text(val):
+    if pd.isna(val):
+        return ""
+    return str(val).replace("\n", " ").replace("\r", " ").strip()
+
+def clean_col_name(col):
+    c = normalize_text(col).lower()
+    c = re.sub(r"[^a-z0-9]+", " ", c).strip()
+    return c
+
+def is_blank(val):
+    s = normalize_text(val).lower()
+    return s in {"", "nan", "none", "null"}
+
+def safe_read_file(uploaded_file):
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix == ".csv":
+        for enc in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
+            try:
+                uploaded_file.seek(0)
+                return pd.read_csv(uploaded_file, dtype=str)
+            except Exception:
+                continue
+        uploaded_file.seek(0)
+        return pd.read_csv(uploaded_file, dtype=str, encoding_errors="ignore")
+    elif suffix in [".xlsx", ".xls"]:
+        uploaded_file.seek(0)
+        return pd.read_excel(uploaded_file, dtype=str)
+    else:
+        raise ValueError(f"Unsupported file format: {suffix}")
+
+def infer_website_from_email(email):
+    email = normalize_text(email).lower()
+    if "@" not in email:
+        return ""
+    domain = email.split("@")[-1].strip()
+    if domain in FREE_EMAIL_DOMAINS or "." not in domain:
+        return ""
+    return f"www.{domain}"
+
+def normalize_website(val):
+    s = normalize_text(val).lower().strip()
+    if not s:
+        return ""
+    s = s.replace("http://", "").replace("https://", "")
+    s = s.strip("/")
+    return s
+
+def extract_linkedin_url(row):
+    for col in row.index:
+        val = normalize_text(row[col])
+        if "linkedin.com/" in val.lower():
+            return val
+    return ""
+
+def looks_like_linkedin_url(val):
+    s = normalize_text(val).lower()
+    return "linkedin.com/" in s
+
+def looks_like_url(val):
+    s = normalize_text(val).lower()
+    return s.startswith(("http://", "https://", "www.")) or bool(re.search(r"\b[a-z0-9.-]+\.[a-z]{2,}\b", s))
+
+def looks_like_email(val):
+    s = normalize_text(val).lower()
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", s))
+
+def looks_like_address(val):
+    s = normalize_text(val)
+    s_lower = s.lower()
+    if not s:
+        return False
+
+    comma_count = s.count(",")
+    digit_count = sum(ch.isdigit() for ch in s)
+
+    address_keywords = [
+        "street", "st ", " st,", "road", "rd ", " avenue", "ave ", "lane", "drive",
+        "park", "square", "building", "floor", "suite", "postcode", "zip",
+        "house", "campus", "business park", "industrial estate"
+    ]
+
+    location_keywords = [
+        "london", "manchester", "birmingham", "leeds", "oxford", "cambridge",
+        "dublin", "paris", "berlin", "madrid", "amsterdam", "brussels",
+        "england", "scotland", "wales", "united kingdom", "ireland", "france",
+        "germany", "spain", "netherlands", "belgium", "italy", "norway",
+        "sweden", "finland", "switzerland", "denmark"
+    ]
+
+    if comma_count >= 3 and digit_count >= 1:
+        return True
+    if any(k in s_lower for k in address_keywords) and digit_count >= 1:
+        return True
+    if any(k in s_lower for k in location_keywords) and comma_count >= 2 and digit_count >= 1:
+        return True
+
+    return False
+
+def normalize_country_text(val):
+    s = normalize_text(val).lower()
+    s = re.sub(r"[^\w\s/,&\-]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def infer_country_from_website(website):
+    site = normalize_website(website)
+    if not site:
+        return ""
+    for tld, country in sorted(TLD_TO_COUNTRY.items(), key=lambda x: len(x[0]), reverse=True):
+        if site.endswith(tld.replace(".", "")) or tld in site:
+            return country
+    return ""
+
+def country_is_uk_europe(country_cell, website_cell=""):
+    s = normalize_country_text(country_cell)
+
+    if not s:
+        inferred = infer_country_from_website(website_cell)
+        return inferred in EUROPEAN_COUNTRIES
+
+    tokens = re.split(r"[/,;&|]+", s)
+    tokens = [t.strip() for t in tokens if t.strip()]
+
+    for t in tokens:
+        if t in EUROPEAN_COUNTRIES:
+            return True
+        if "united kingdom" in t or t == "uk" or t == "gb":
+            return True
+        if "europe" in t or t == "eu":
+            return True
+
+    inferred = infer_country_from_website(website_cell)
+    return inferred in EUROPEAN_COUNTRIES
+
+def is_valid_person_name(val):
+    s = normalize_text(val)
+    s_lower = s.lower()
+
+    if not s or len(s) < 2:
+        return False
+    if looks_like_linkedin_url(s) or looks_like_url(s) or looks_like_email(s):
+        return False
+    if looks_like_address(s):
+        return False
+    if s_lower in {"name", "contact", "decision maker", "unknown"}:
+        return False
+    if sum(ch.isdigit() for ch in s) > 3:
+        return False
+
+    return True
+
+def is_valid_company_name(val):
+    s = normalize_text(val)
+    s_lower = s.lower()
+
+    if not s or s_lower in {"nan", "none", "null", "organisation", "organization", "company name", "account"}:
+        return False
+    if looks_like_linkedin_url(s):
+        return False
+    if s_lower.startswith(("http://", "https://", "www.")):
+        return False
+    if looks_like_email(s):
+        return False
+    if looks_like_address(s):
+        return False
+    if sum(ch.isdigit() for ch in s) > 8:
+        return False
+
+    # Reject obvious search strings / prompts / junk
+    junk_patterns = [
+        r"site:linkedin\.com",
+        r"\bnot job\b",
+        r"\bor careers\b",
+        r"\brecruiter\b",
+        r"\bhead of\b",
+        r"\bdirector of\b",
+        r"\bchief\b",
+        r"\bmanager\b",
+        r"\bconsultant\b",
+        r"\bspeaker\b",
+        r"\binternship\b",
+        r"\bopen for\b"
+    ]
+    for pat in junk_patterns:
+        if re.search(pat, s_lower):
+            return False
+
+    return True
+
+def dedupe_key_company(name, website):
+    return f"{normalize_text(name).lower()}||{normalize_website(website)}"
+
+def map_columns(df):
+    file_mapping = {}
+    master_headers = MASTER_CORE_HEADERS.copy()
+
+    for col in df.columns:
+        norm_col = clean_col_name(col)
+
+        # PERSON / CONTACT
+        if any(k in norm_col for k in ["decision maker", "contact person", "contact name", "full name"]):
+            file_mapping[col] = "Decision Maker"
+
+        elif norm_col == "name":
+            file_mapping[col] = col  # leave plain "Name" untouched to avoid wrong forced mapping
+
+        elif any(k in norm_col for k in ["job title", "title", "designation", "role", "position"]):
+            file_mapping[col] = "Job Title"
+
+        # ORGANISATION
+        elif any(k in norm_col for k in [
+            "organisation", "organization", "company", "company name",
+            "account", "institution", "school", "university", "employer"
+        ]):
+            file_mapping[col] = "Organisation"
+
+        elif "country" in norm_col or "region" == norm_col:
+            file_mapping[col] = "Country"
+
+        elif any(k in norm_col for k in ["segment", "industry", "vertical", "category", "type"]):
+            file_mapping[col] = "Segment"
+
+        elif "email" in norm_col:
+            file_mapping[col] = "Email"
+
+        elif any(k in norm_col for k in ["website", "web site", "domain", "company url", "organisation url", "organization url"]):
+            file_mapping[col] = "Website"
+
+        elif any(k in norm_col for k in ["location", "city", "address", "hq", "head office", "office"]):
+            file_mapping[col] = "Location"
+
+        elif "linkedin" in norm_col:
+            file_mapping[col] = "LinkedIn URL"
+
         else:
-            sheets_to_check.append(s_name)
+            file_mapping[col] = col
+            if col not in master_headers:
+                master_headers.append(col)
 
-    for sheet_name in sheets_to_check:
-        df_raw = excel.parse(sheet_name, header=None, nrows=50)
-        if df_raw.empty:
-            continue
-            
-        for idx, row in df_raw.iterrows():
-            row_str = " ".join([str(val).lower() for val in row.dropna() if isinstance(val, str)])
-            score = sum(1 for kw in TARGET_KEYWORDS if kw in row_str)
-            
-            if score > best_score:
-                best_score = score
-                best_df = excel.parse(sheet_name, header=idx)
-    
-    if best_df is not None and best_score >= 3:
-        best_df = best_df.dropna(axis=1, how='all')
-        best_df = best_df.loc[:, ~best_df.columns.astype(str).str.contains('^Unnamed')]
-        return best_df
-    
-    return pd.read_excel(file_bytes)
+    return file_mapping, master_headers
 
-def map_headers(all_columns_list, threshold):
-    master_headers = []
-    mapping_per_file = []
-    
-    for cols in all_columns_list:
-        file_mapping = {}
-        for col in cols:
-            norm_col = normalize(col)
-            match = get_close_matches(
-                norm_col, [normalize(m) for m in master_headers],
-                n=1, cutoff=threshold
-            )
-            
-            if "decision maker" in norm_col or "contact" in norm_col or "name" in norm_col:
-                if "Decision Maker" not in master_headers:
-                    master_headers.append("Decision Maker")
-                file_mapping[col] = "Decision Maker"
-            elif "organisation" in norm_col or "company" in norm_col or "account" in norm_col:
-                if "Organisation" not in master_headers:
-                    master_headers.append("Organisation")
-                file_mapping[col] = "Organisation"
-            elif "role" in norm_col or "title" in norm_col:
-                if "Role" not in master_headers:
-                    master_headers.append("Role")
-                file_mapping[col] = "Role"
-            elif "linkedin" in norm_col:
-                if "Linkedin" not in master_headers:
-                    master_headers.append("Linkedin")
-                file_mapping[col] = "Linkedin"
-            elif "email" in norm_col:
-                if "Email" not in master_headers:
-                    master_headers.append("Email")
-                file_mapping[col] = "Email"
-            elif "tier" in norm_col:
-                if "Tier" not in master_headers:
-                    master_headers.append("Tier")
-                file_mapping[col] = "Tier"
-            elif "website" in norm_col or "domain" in norm_col:
-                if "Website" not in master_headers:
-                    master_headers.append("Website")
-                file_mapping[col] = "Website"
-            elif "location" in norm_col or "address" in norm_col:
-                if "Location" not in master_headers:
-                    master_headers.append("Location")
-                file_mapping[col] = "Location"
-            elif match:
-                idx = [normalize(m) for m in master_headers].index(match[0])
-                file_mapping[col] = master_headers[idx]
-            else:
-                clean_header = str(col).replace('\n', ' ').strip()
-                if clean_header not in master_headers:
-                    master_headers.append(clean_header)
-                file_mapping[col] = clean_header
-                
-        mapping_per_file.append(file_mapping)
-        
-    return master_headers, mapping_per_file
+def standardize_df(df, source_name):
+    df = df.copy()
+    df.columns = [normalize_text(c) for c in df.columns]
+    file_mapping, master_headers = map_columns(df)
+
+    std = pd.DataFrame(columns=master_headers)
+
+    for old_col, new_col in file_mapping.items():
+        std[new_col] = df[old_col].astype(str)
+
+    for col in master_headers:
+        if col not in std.columns:
+            std[col] = ""
+
+    std["Source File"] = source_name
+
+    # derive LinkedIn URL if hidden inside any field
+    if "LinkedIn URL" not in std.columns:
+        std["LinkedIn URL"] = ""
+    std["LinkedIn URL"] = std["LinkedIn URL"].replace("nan", "").fillna("")
+    derived_li = df.apply(extract_linkedin_url, axis=1)
+    std["LinkedIn URL"] = np.where(std["LinkedIn URL"].astype(str).str.strip() == "", derived_li, std["LinkedIn URL"])
+
+    # derive Website from email if blank
+    std["Website"] = std["Website"].replace("nan", "").fillna("")
+    std["Email"] = std["Email"].replace("nan", "").fillna("")
+    std["Website"] = np.where(
+        std["Website"].astype(str).str.strip() == "",
+        std["Email"].apply(infer_website_from_email),
+        std["Website"]
+    )
+
+    return std
+
+def build_master_df(files):
+    all_dfs = []
+    errors = []
+
+    for f in files:
+        try:
+            raw = safe_read_file(f)
+            raw = raw.fillna("")
+            std = standardize_df(raw, f.name)
+            all_dfs.append(std)
+        except Exception as e:
+            errors.append(f"{f.name}: {e}")
+
+    if all_dfs:
+        master_df = pd.concat(all_dfs, ignore_index=True)
+    else:
+        master_df = pd.DataFrame(columns=MASTER_CORE_HEADERS)
+
+    # clean whitespace
+    for col in master_df.columns:
+        master_df[col] = master_df[col].astype(str).apply(normalize_text)
+
+    return master_df, errors
+
+def build_contact_master(master_df):
+    df = master_df.copy()
+
+    # Keep broad contact output but clean obvious junk
+    if "Decision Maker" in df.columns:
+        df = df[
+            (df["Decision Maker"].apply(lambda x: is_blank(x) or is_valid_person_name(x)))
+        ].copy()
+
+    # clean website
+    df["Website"] = df["Website"].apply(normalize_website)
+
+    return df.reset_index(drop=True)
+
+def build_company_master(master_df):
+    df = master_df.copy()
+
+    for c in ["Organisation", "Country", "Segment", "Website", "Location", "Decision Maker", "LinkedIn URL"]:
+        if c not in df.columns:
+            df[c] = ""
+
+    # Prefer Organisation only for company master
+    df["Company Name"] = df["Organisation"].astype(str).apply(normalize_text)
+
+    # Backup logic only if Organisation blank:
+    # Use a few safe institution-like headers if present, but never generic person/name/linkedin/address/url values
+    if "Company Name" not in df.columns:
+        df["Company Name"] = ""
+
+    # Clean Website
+    df["Website"] = df["Website"].apply(normalize_website)
+
+    # Validate company name
+    df["company_valid"] = df["Company Name"].apply(is_valid_company_name)
+
+    # Filter UK + Europe only
+    df["country_ok"] = df.apply(lambda r: country_is_uk_europe(r.get("Country", ""), r.get("Website", "")), axis=1)
+
+    # Remove rows where company name looks like LinkedIn or URL, visible in your file output
+    df = df[df["company_valid"] & df["country_ok"]].copy()
+
+    # If country blank, infer from website
+    df["Country"] = np.where(
+        df["Country"].astype(str).str.strip() == "",
+        df["Website"].apply(infer_country_from_website).str.title(),
+        df["Country"]
+    )
+
+    # Final shape
+    company_df = df[["Company Name", "Country", "Segment", "Website", "Location"]].copy()
+
+    # Additional cleanup
+    company_df["Company Name"] = company_df["Company Name"].apply(normalize_text)
+    company_df["Country"] = company_df["Country"].apply(normalize_text)
+    company_df["Segment"] = company_df["Segment"].apply(normalize_text)
+    company_df["Website"] = company_df["Website"].apply(normalize_text)
+    company_df["Location"] = company_df["Location"].apply(normalize_text)
+
+    # Drop junk placeholders
+    company_df = company_df[
+        company_df["Company Name"].apply(is_valid_company_name)
+    ].copy()
+
+    # Dedupe
+    company_df["dedupe_key"] = company_df.apply(lambda r: dedupe_key_company(r["Company Name"], r["Website"]), axis=1)
+    company_df = company_df.drop_duplicates(subset=["dedupe_key"], keep="first").drop(columns=["dedupe_key"])
+
+    # Sort
+    company_df = company_df.sort_values(by=["Country", "Company Name"], na_position="last").reset_index(drop=True)
+
+    return company_df
+
+def to_excel_bytes(sheets_dict):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for sheet_name, df in sheets_dict.items():
+            safe_name = sheet_name[:31]
+            df.to_excel(writer, sheet_name=safe_name, index=False)
+    output.seek(0)
+    return output
+
+def to_csv_bytes(df):
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+# =========================
+# UI
+# =========================
+st.title("Lead & Company Consolidator")
+st.caption("Upload CSV/XLSX files, standardize fields, clean bad rows, and extract a UK + Europe company master.")
+
+uploaded_files = st.file_uploader(
+    "Upload one or more CSV/XLSX files",
+    type=["csv", "xlsx", "xls"],
+    accept_multiple_files=True
+)
 
 if uploaded_files:
-    dataframes = []
-    all_columns_list = []
-    
-    with st.spinner('Scanning files and extracting tables...'):
-        for f in uploaded_files:
-            # --- ZIP FILE HANDLING LOGIC ---
-            if f.name.endswith('.zip'):
-                with zipfile.ZipFile(f, 'r') as z:
-                    for file_info in z.infolist():
-                        # Only process excel files, ignore mac __MACOSX system files
-                        if (file_info.filename.endswith('.xlsx') or file_info.filename.endswith('.xls')) and not file_info.filename.startswith('__MACOSX/'):
-                            with z.open(file_info) as excel_file:
-                                file_bytes = BytesIO(excel_file.read())
-                                df = extract_clean_table(file_bytes)
-                                df = df.dropna(how='all')
-                                dataframes.append(df)
-                                all_columns_list.append(list(df.columns))
-            # --- NORMAL EXCEL HANDLING LOGIC ---
-            else:
-                df = extract_clean_table(f)
-                df = df.dropna(how='all')
-                dataframes.append(df)
-                all_columns_list.append(list(df.columns))
+    master_df, errors = build_master_df(uploaded_files)
 
-    # If no valid data was found (e.g., zip was empty or had no excel files)
-    if not dataframes:
-        st.error("No valid Excel data found in the uploaded files/zip.")
-    else:
-        master_headers, mapping_per_file = map_headers(all_columns_list, similarity_threshold)
+    if errors:
+        st.warning("Some files could not be processed:")
+        for e in errors:
+            st.write(f"- {e}")
 
-        aligned_dfs = []
-        for df, mapping in zip(dataframes, mapping_per_file):
-            renamed_df = df.rename(columns=mapping)
-            renamed_df = renamed_df.loc[:, ~renamed_df.columns.duplicated()]
-            renamed_df = renamed_df.reindex(columns=master_headers)
-            aligned_dfs.append(renamed_df)
+    contact_df = build_contact_master(master_df)
+    company_df = build_company_master(master_df)
 
-        master_df = pd.concat(aligned_dfs, ignore_index=True)
-        
-        tab1, tab2 = st.tabs(["📊 Full Execution Merge", "🏢 Company Master List"])
+    # Metrics
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total consolidated rows", len(master_df))
+    c2.metric("Clean contact rows", len(contact_df))
+    c3.metric("Clean UK + Europe companies", len(company_df))
 
-        with tab1:
-            st.subheader("🧹 Deduplication Settings (Execution Sheet)")
-            dedup_enabled = st.checkbox("Remove duplicate leads", value=True, key="dedup_full")
-            
-            tab1_df = master_df.copy()
-            
-            if dedup_enabled:
-                if "Organisation" in tab1_df.columns:
-                    dedup_col = "Organisation"
-                else:
-                    dedup_col = master_headers[0]
-                    
-                st.write(f"Removing duplicate leads based on **{dedup_col}**.")
-                temp_key = tab1_df[dedup_col].astype(str).str.strip().str.lower()
-                
-                before_count = len(tab1_df)
-                tab1_df = tab1_df[~temp_key.duplicated(keep="first")]
-                after_count = len(tab1_df)
-                st.write(f"Removed **{before_count - after_count}** duplicates.")
-            
-            priority_cols = ["Tier", "Organisation", "Country", "Segment", "Decision Maker", "Role", "Linkedin", "Email"]
-            final_cols = []
-            
-            for p_col in priority_cols:
-                for actual_col in tab1_df.columns:
-                    if normalize(p_col) == normalize(actual_col) and actual_col not in final_cols:
-                        final_cols.append(actual_col)
-                        
-            for col in tab1_df.columns:
-                if col not in final_cols:
-                    final_cols.append(col)
-                    
-            tab1_df = tab1_df[final_cols]
+    # Tabs
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Master Contact Data",
+        "Company Master (UK + Europe)",
+        "Quality Checks",
+        "Downloads"
+    ])
 
-            st.dataframe(tab1_df, use_container_width=True)
+    with tab1:
+        st.subheader("Master Contact Data")
+        st.write("Standardized full dataset across uploaded files.")
+        st.dataframe(contact_df, use_container_width=True, height=550)
 
-            output_tab1 = BytesIO()
-            with pd.ExcelWriter(output_tab1, engine="openpyxl") as writer:
-                tab1_df.to_excel(writer, index=False, sheet_name="Master Execution")
-            output_tab1.seek(0)
+    with tab2:
+        st.subheader("Company Master (UK + Europe only)")
+        st.write("Clean companies only. LinkedIn URLs, website strings, addresses, and non-UK/Europe rows are excluded.")
+        st.dataframe(company_df, use_container_width=True, height=550)
 
-            st.download_button(
-                label="📥 Download Full Execution Master",
-                data=output_tab1,
-                file_name="execution_master_file.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+    with tab3:
+        st.subheader("Quality Checks")
 
-        with tab2:
-            st.subheader("🏢 Extracted Company List")
-            st.write("This view extracts core company details, derives missing websites from email addresses, drops blank companies, and removes duplicates.")
-            
-            tab2_df = master_df.copy()
-            
-            if "Email" not in tab2_df.columns:
-                tab2_df["Email"] = ""
-                
-            required_company_cols = ["Organisation", "Country", "Segment", "Website", "Location"]
-            for c in required_company_cols:
-                if c not in tab2_df.columns:
-                    tab2_df[c] = ""
-                    
-            free_emails = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com", "live.com"]
-            
-            def derive_website(row):
-                website = str(row.get("Website", "")).strip()
-                if website and website.lower() != "nan":
-                    return website
-                
-                email = str(row.get("Email", "")).strip()
-                if "@" in email:
-                    domain = email.split("@")[-1].lower()
-                    if domain not in free_emails:
-                        return "www." + domain
-                return ""
-                
-            tab2_df["Website"] = tab2_df.apply(derive_website, axis=1)
-            
-            company_df = tab2_df[required_company_cols].copy()
-            company_df.rename(columns={"Organisation": "Company Name"}, inplace=True)
-            
-            company_df["temp_key"] = company_df["Company Name"].astype(str).str.strip().str.lower()
-            company_df = company_df[~company_df["temp_key"].isin(["nan", ""])]
-            
-            before_company_count = len(company_df)
-            company_df = company_df.drop_duplicates(subset=["temp_key"], keep="first")
-            after_company_count = len(company_df)
-            
-            company_df.drop(columns=["temp_key"], inplace=True)
-            
-            st.write(f"Found **{after_company_count}** unique companies.")
-            
-            st.dataframe(company_df, use_container_width=True)
-            
-            output_tab2 = BytesIO()
-            with pd.ExcelWriter(output_tab2, engine="openpyxl") as writer:
-                company_df.to_excel(writer, index=False, sheet_name="Company Master")
-            output_tab2.seek(0)
+        qc1 = master_df[master_df["Organisation"].apply(looks_like_linkedin_url)][["Organisation", "Country", "Website", "Source File"]].copy()
+        qc2 = master_df[master_df["Organisation"].apply(looks_like_address)][["Organisation", "Country", "Website", "Source File"]].copy()
+        qc3 = master_df[~master_df.apply(lambda r: country_is_uk_europe(r.get("Country", ""), r.get("Website", "")), axis=1)][["Organisation", "Country", "Website", "Source File"]].copy()
 
-            st.download_button(
-                label="📥 Download Clean Company Master",
-                data=output_tab2,
-                file_name="company_master_list.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        st.markdown("**Organisation values that look like LinkedIn URLs**")
+        st.dataframe(qc1, use_container_width=True, height=220)
+
+        st.markdown("**Organisation values that look like addresses**")
+        st.dataframe(qc2, use_container_width=True, height=220)
+
+        st.markdown("**Rows excluded from company master because country is outside UK/Europe**")
+        st.dataframe(qc3, use_container_width=True, height=220)
+
+    with tab4:
+        st.subheader("Downloads")
+
+        excel_bytes = to_excel_bytes({
+            "Master Contact Data": contact_df,
+            "Company Master UK Europe": company_df,
+            "Raw Consolidated": master_df
+        })
+
+        st.download_button(
+            label="Download Excel workbook",
+            data=excel_bytes,
+            file_name="consolidated_output_uk_europe_clean.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        st.download_button(
+            label="Download Company Master CSV",
+            data=to_csv_bytes(company_df),
+            file_name="company_master_uk_europe_clean.csv",
+            mime="text/csv"
+        )
+
+        st.download_button(
+            label="Download Master Contact CSV",
+            data=to_csv_bytes(contact_df),
+            file_name="master_contact_data_clean.csv",
+            mime="text/csv"
+        )
 
 else:
-    st.info("Please upload your execution files.")
+    st.info("Upload one or more files to begin.")
+
+st.markdown("---")
+st.caption("Rules applied: UK + Europe only for company extraction; LinkedIn URLs removed from company names; website/address-like rows rejected; website can be inferred from business email.")
