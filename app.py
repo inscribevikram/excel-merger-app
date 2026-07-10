@@ -6,27 +6,61 @@ from io import BytesIO
 from difflib import get_close_matches
 
 st.set_page_config(page_title="Excel Master File Merger", layout="wide")
-st.title("📊 Excel Master File Merger")
-st.write("Upload multiple Excel files. The app maps similar headers, adds missing "
-         "columns, combines them, removes duplicates, and validates data quality.")
+st.title("📊 Smart Excel File Merger")
+st.write("Upload your execution sheets. This app automatically scans all sheets, finds "
+         "the actual data table (ignoring title/junk rows), maps the headers, and merges them.")
 
 uploaded_files = st.file_uploader(
     "Upload Excel files", type=["xlsx", "xls"], accept_multiple_files=True
 )
 
 similarity_threshold = st.slider(
-    "Header matching sensitivity (higher = stricter match)", 0.5, 1.0, 0.8, 0.05
+    "Header matching sensitivity (Lower = more aggressive matching)", 0.5, 1.0, 0.7, 0.05
 )
 
-EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
-PHONE_REGEX = re.compile(r"^\+?[0-9\s\-()]{7,15}$")
-
+# Standardize column strings for matching
 def normalize(col):
     return str(col).strip().lower().replace("_", " ")
+
+# Core logic: Find the best sheet and the starting row of the actual data
+def extract_clean_table(file):
+    excel = pd.ExcelFile(file)
+    best_df = None
+    best_score = -1
+    
+    # Keywords that usually indicate a "target" table in your SDR workflow
+    target_keywords = ["organisation", "company", "country", "segment", "role", "email", "linkedin", "decision maker", "contact"]
+    
+    for sheet_name in excel.sheet_names:
+        # Read the first 50 rows of the sheet with no header assumption
+        df_raw = excel.parse(sheet_name, header=None, nrows=50)
+        
+        if df_raw.empty:
+            continue
+            
+        # Scan each row to see if it looks like a header row
+        for idx, row in df_raw.iterrows():
+            row_str = " ".join([str(val).lower() for val in row.dropna() if isinstance(val, str)])
+            score = sum(1 for kw in target_keywords if kw in row_str)
+            
+            if score > best_score:
+                best_score = score
+                # If we found a row with good headers, read the whole sheet starting from this row
+                best_df = excel.parse(sheet_name, header=idx)
+                
+    if best_df is not None and best_score > 0:
+        # Drop columns that are completely unnamed or empty
+        best_df = best_df.dropna(axis=1, how='all')
+        best_df = best_df.loc[:, ~best_df.columns.astype(str).str.contains('^Unnamed')]
+        return best_df
+    else:
+        # Fallback if no obvious header row was found
+        return pd.read_excel(file)
 
 def map_headers(all_columns_list, threshold):
     master_headers = []
     mapping_per_file = []
+    
     for cols in all_columns_list:
         file_mapping = {}
         for col in cols:
@@ -49,17 +83,22 @@ def find_col(headers, keyword):
     return matches[0] if matches else None
 
 if uploaded_files:
-    dataframes, all_columns_list, file_names = [], [], []
+    dataframes = []
+    all_columns_list = []
+    file_names = []
 
-    for f in uploaded_files:
-        df = pd.read_excel(f)
-        dataframes.append(df)
-        all_columns_list.append(list(df.columns))
-        file_names.append(f.name)
+    with st.spinner('Scanning files and extracting tables...'):
+        for f in uploaded_files:
+            df = extract_clean_table(f)
+            # Drop empty rows that might have been picked up at the bottom
+            df = df.dropna(how='all')
+            dataframes.append(df)
+            all_columns_list.append(list(df.columns))
+            file_names.append(f.name)
 
     master_headers, mapping_per_file = map_headers(all_columns_list, similarity_threshold)
 
-    st.subheader("🔍 Header Mapping Preview")
+    st.subheader("🔍 Auto-Detected Header Mapping Preview")
     for name, mapping in zip(file_names, mapping_per_file):
         with st.expander(f"Mapping for: {name}"):
             st.json(mapping)
@@ -67,116 +106,40 @@ if uploaded_files:
     aligned_dfs = []
     for df, mapping, name in zip(dataframes, mapping_per_file, file_names):
         renamed_df = df.rename(columns=mapping)
-        
-        # --- FIX: Drop duplicate columns before reindexing ---
         renamed_df = renamed_df.loc[:, ~renamed_df.columns.duplicated()]
-        
         renamed_df = renamed_df.reindex(columns=master_headers)
         renamed_df["__source_file"] = name
         aligned_dfs.append(renamed_df)
 
     master_df = pd.concat(aligned_dfs, ignore_index=True)
 
-    st.subheader("✅ Combined Master File (Before Dedup)")
+    st.subheader("✅ Combined Master File")
     st.dataframe(master_df, use_container_width=True)
     st.write(f"**Total rows:** {len(master_df)} | **Total columns:** {len(master_df.columns)}")
 
+    # Deduplication
     st.subheader("🧹 Deduplication Settings")
     dedup_enabled = st.checkbox("Remove duplicate rows", value=True)
     dedup_df = master_df.copy()
 
     if dedup_enabled:
-        default_email_col = find_col(master_headers, "email") or master_headers[0]
+        # Tries to find email or linkedin as the default duplicate checker
+        default_dedup_col = find_col(master_headers, "email") or find_col(master_headers, "linkedin") or master_headers[0]
         dedup_column = st.selectbox(
-            "Select column to check duplicates on (e.g. Email)",
+            "Select column to check duplicates on (e.g. Email or LinkedIn)",
             options=master_headers,
-            index=master_headers.index(default_email_col)
+            index=master_headers.index(default_dedup_col)
         )
         keep_option = st.radio(
-            "When duplicates are found, keep:",
+            "Keep:",
             options=["First occurrence", "Last occurrence"], index=0, horizontal=True
         )
         keep_value = "first" if keep_option == "First occurrence" else "last"
-        case_insensitive = st.checkbox("Ignore case & extra spaces (recommended for emails)", value=True)
-
-        temp_key = dedup_df[dedup_column].astype(str).str.strip().str.lower() if case_insensitive else dedup_df[dedup_column]
-
-        before_count = len(dedup_df)
-        duplicate_mask = temp_key.duplicated(keep=False)
-        duplicates_preview = dedup_df[duplicate_mask]
-
-        st.write("**Duplicates found per source file:**")
-        if duplicate_mask.sum() > 0:
-            dup_summary = duplicates_preview.groupby("__source_file").size().reset_index(name="duplicate_rows")
-            st.dataframe(dup_summary, use_container_width=True)
-        else:
-            st.write("No duplicates found.")
-
+        
+        # Deduplicate ignoring case
+        temp_key = dedup_df[dedup_column].astype(str).str.strip().str.lower()
         dedup_df = dedup_df[~temp_key.duplicated(keep=keep_value)]
-        after_count = len(dedup_df)
-        removed_count = before_count - after_count
-        st.write(f"**Total duplicates:** {duplicate_mask.sum()} rows | "
-                 f"**Removed:** {removed_count} | **Remaining:** {after_count}")
-
-        if duplicate_mask.sum() > 0:
-            with st.expander("👀 Preview duplicate rows (before removal)"):
-                st.dataframe(duplicates_preview, use_container_width=True)
-
-    st.subheader("🛡️ Data Validation Checks")
-    run_validation = st.checkbox("Run validation checks", value=True)
-
-    if run_validation:
-        email_col = find_col(master_headers, "email")
-        phone_col = find_col(master_headers, "phone")
-
-        required_cols = st.multiselect(
-            "Select required columns (flag rows with blanks in these)",
-            options=master_headers,
-            default=[c for c in [email_col] if c]
-        )
-
-        issues = pd.DataFrame(index=dedup_df.index)
-        issues["__source_file"] = dedup_df["__source_file"]
-
-        if email_col:
-            issues["invalid_email"] = ~dedup_df[email_col].astype(str).apply(
-                lambda x: bool(EMAIL_REGEX.match(x.strip())) if x.strip().lower() != "nan" else False
-            )
-            issues["invalid_email"] = issues["invalid_email"] & dedup_df[email_col].notna()
-
-        if phone_col:
-            issues["invalid_phone"] = ~dedup_df[phone_col].astype(str).apply(
-                lambda x: bool(PHONE_REGEX.match(x.strip())) if x.strip().lower() != "nan" else False
-            )
-            issues["invalid_phone"] = issues["invalid_phone"] & dedup_df[phone_col].notna()
-
-        for col in required_cols:
-            issues[f"missing_{col}"] = dedup_df[col].isna() | (dedup_df[col].astype(str).str.strip() == "")
-
-        flag_cols = [c for c in issues.columns if c != "__source_file"]
-        issues["has_issue"] = issues[flag_cols].any(axis=1) if flag_cols else False
-
-        total_flagged = issues["has_issue"].sum()
-        st.write(f"**Rows with validation issues:** {total_flagged} out of {len(dedup_df)}")
-
-        if flag_cols:
-            summary_rows = []
-            for col in flag_cols:
-                summary_rows.append({"Check": col, "Rows flagged": int(issues[col].sum())})
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
-
-        if total_flagged > 0:
-            with st.expander("👀 Preview rows with validation issues"):
-                flagged_view = dedup_df[issues["has_issue"]].copy()
-                for col in flag_cols:
-                    flagged_view[col] = issues.loc[issues["has_issue"], col]
-                st.dataframe(flagged_view, use_container_width=True)
-
-        dedup_df["__validation_flag"] = issues["has_issue"].map({True: "ISSUE", False: "OK"})
-
-    st.subheader("✅ Final Master File Preview")
-    st.dataframe(dedup_df, use_container_width=True)
-    st.write(f"**Final rows:** {len(dedup_df)} | **Final columns:** {len(dedup_df.columns)}")
+        st.write(f"Removed **{len(master_df) - len(dedup_df)}** duplicates.")
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -184,10 +147,10 @@ if uploaded_files:
     output.seek(0)
 
     st.download_button(
-        label="📥 Download Master Excel File (Validated & Deduplicated)",
+        label="📥 Download Smart Master File",
         data=output,
-        file_name="master_file_final.xlsx",
+        file_name="smart_master_file.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 else:
-    st.info("Please upload at least two Excel files to begin.")
+    st.info("Please upload your execution files.")
