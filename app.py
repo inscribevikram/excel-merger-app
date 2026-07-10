@@ -64,9 +64,13 @@ if uploaded_files:
         with st.expander(f"Mapping for: {name}"):
             st.json(mapping)
 
-    aligned_dfs = []
+       aligned_dfs = []
     for df, mapping, name in zip(dataframes, mapping_per_file, file_names):
         renamed_df = df.rename(columns=mapping)
+        
+        # --- FIX: Drop duplicate columns before reindexing ---
+        renamed_df = renamed_df.loc[:, ~renamed_df.columns.duplicated()]
+        
         renamed_df = renamed_df.reindex(columns=master_headers)
         renamed_df["__source_file"] = name
         aligned_dfs.append(renamed_df)
