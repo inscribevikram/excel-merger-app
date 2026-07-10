@@ -1,61 +1,63 @@
 # app.py
 import streamlit as st
 import pandas as pd
-import re
 from io import BytesIO
 from difflib import get_close_matches
 
 st.set_page_config(page_title="Excel Master File Merger", layout="wide")
 st.title("📊 Smart Excel File Merger")
-st.write("Upload your execution sheets. This app automatically scans all sheets, finds "
-         "the actual data table (ignoring title/junk rows), maps the headers, and merges them.")
 
 uploaded_files = st.file_uploader(
     "Upload Excel files", type=["xlsx", "xls"], accept_multiple_files=True
 )
 
 similarity_threshold = st.slider(
-    "Header matching sensitivity (Lower = more aggressive matching)", 0.5, 1.0, 0.7, 0.05
+    "Header matching sensitivity", 0.5, 1.0, 0.7, 0.05
 )
 
-# Standardize column strings for matching
+# Target keywords that indicate we found the right table
+TARGET_KEYWORDS = [
+    "organisation", "company", "account", "country", "segment", 
+    "role", "title", "email", "linkedin", "decision maker", 
+    "contact", "pain point", "signal", "tier"
+]
+
 def normalize(col):
     return str(col).strip().lower().replace("_", " ")
 
-# Core logic: Find the best sheet and the starting row of the actual data
 def extract_clean_table(file):
     excel = pd.ExcelFile(file)
     best_df = None
     best_score = -1
     
-    # Keywords that usually indicate a "target" table in your SDR workflow
-    target_keywords = ["organisation", "company", "country", "segment", "role", "email", "linkedin", "decision maker", "contact"]
+    target_sheet_names = ["Priority Prospects", "Execution", "Sheet1"]
+    sheets_to_check = []
     
-    for sheet_name in excel.sheet_names:
-        # Read the first 50 rows of the sheet with no header assumption
+    for s_name in excel.sheet_names:
+        if any(target.lower() in s_name.lower() for target in target_sheet_names):
+            sheets_to_check.insert(0, s_name)
+        else:
+            sheets_to_check.append(s_name)
+
+    for sheet_name in sheets_to_check:
         df_raw = excel.parse(sheet_name, header=None, nrows=50)
-        
         if df_raw.empty:
             continue
             
-        # Scan each row to see if it looks like a header row
         for idx, row in df_raw.iterrows():
             row_str = " ".join([str(val).lower() for val in row.dropna() if isinstance(val, str)])
-            score = sum(1 for kw in target_keywords if kw in row_str)
+            score = sum(1 for kw in TARGET_KEYWORDS if kw in row_str)
             
             if score > best_score:
                 best_score = score
-                # If we found a row with good headers, read the whole sheet starting from this row
                 best_df = excel.parse(sheet_name, header=idx)
-                
-    if best_df is not None and best_score > 0:
-        # Drop columns that are completely unnamed or empty
+    
+    if best_df is not None and best_score >= 3:
         best_df = best_df.dropna(axis=1, how='all')
         best_df = best_df.loc[:, ~best_df.columns.astype(str).str.contains('^Unnamed')]
         return best_df
-    else:
-        # Fallback if no obvious header row was found
-        return pd.read_excel(file)
+    
+    return pd.read_excel(file)
 
 def map_headers(all_columns_list, threshold):
     master_headers = []
@@ -69,81 +71,85 @@ def map_headers(all_columns_list, threshold):
                 norm_col, [normalize(m) for m in master_headers],
                 n=1, cutoff=threshold
             )
-            if match:
+            
+            # --- HARDCODED SDR ALIASES ---
+            if "decision maker" in norm_col or "contact" in norm_col or "name" in norm_col:
+                if "Decision Maker" not in master_headers:
+                    master_headers.append("Decision Maker")
+                file_mapping[col] = "Decision Maker"
+            elif "organisation" in norm_col or "company" in norm_col or "account" in norm_col:
+                if "Organisation" not in master_headers:
+                    master_headers.append("Organisation")
+                file_mapping[col] = "Organisation"
+            elif "role" in norm_col or "title" in norm_col:
+                if "Role" not in master_headers:
+                    master_headers.append("Role")
+                file_mapping[col] = "Role"
+            elif "linkedin" in norm_col:
+                if "Linkedin" not in master_headers:
+                    master_headers.append("Linkedin")
+                file_mapping[col] = "Linkedin"
+            elif "email" in norm_col:
+                if "Email" not in master_headers:
+                    master_headers.append("Email")
+                file_mapping[col] = "Email"
+            elif match:
                 idx = [normalize(m) for m in master_headers].index(match[0])
                 file_mapping[col] = master_headers[idx]
             else:
                 master_headers.append(col)
                 file_mapping[col] = col
+                
         mapping_per_file.append(file_mapping)
+        
     return master_headers, mapping_per_file
-
-def find_col(headers, keyword):
-    matches = [h for h in headers if keyword in normalize(h)]
-    return matches[0] if matches else None
 
 if uploaded_files:
     dataframes = []
     all_columns_list = []
-    file_names = []
-
+    
     with st.spinner('Scanning files and extracting tables...'):
         for f in uploaded_files:
             df = extract_clean_table(f)
-            # Drop empty rows that might have been picked up at the bottom
             df = df.dropna(how='all')
             dataframes.append(df)
             all_columns_list.append(list(df.columns))
-            file_names.append(f.name)
 
     master_headers, mapping_per_file = map_headers(all_columns_list, similarity_threshold)
 
-    st.subheader("🔍 Auto-Detected Header Mapping Preview")
-    for name, mapping in zip(file_names, mapping_per_file):
-        with st.expander(f"Mapping for: {name}"):
-            st.json(mapping)
-
     aligned_dfs = []
-    for df, mapping, name in zip(dataframes, mapping_per_file, file_names):
+    for df, mapping in zip(dataframes, mapping_per_file):
         renamed_df = df.rename(columns=mapping)
         renamed_df = renamed_df.loc[:, ~renamed_df.columns.duplicated()]
         renamed_df = renamed_df.reindex(columns=master_headers)
-        renamed_df["__source_file"] = name
         aligned_dfs.append(renamed_df)
 
     master_df = pd.concat(aligned_dfs, ignore_index=True)
+    
+    # --- REORDER COLUMNS TO MATCH YOUR PREFERRED LAYOUT ---
+    # These columns will be forced to the front in this exact order
+    priority_cols = ["Tier", "Priority Tier", "Organisation", "Country", "Segment", "Decision Maker", "Role", "Linkedin", "Email"]
+    final_cols = []
+    
+    # Grab priority columns first if they exist
+    for p_col in priority_cols:
+        for actual_col in master_df.columns:
+            if normalize(p_col) == normalize(actual_col) and actual_col not in final_cols:
+                final_cols.append(actual_col)
+                
+    # Grab the rest of the columns
+    for col in master_df.columns:
+        if col not in final_cols:
+            final_cols.append(col)
+            
+    master_df = master_df[final_cols]
 
     st.subheader("✅ Combined Master File")
     st.dataframe(master_df, use_container_width=True)
-    st.write(f"**Total rows:** {len(master_df)} | **Total columns:** {len(master_df.columns)}")
-
-    # Deduplication
-    st.subheader("🧹 Deduplication Settings")
-    dedup_enabled = st.checkbox("Remove duplicate rows", value=True)
-    dedup_df = master_df.copy()
-
-    if dedup_enabled:
-        # Tries to find email or linkedin as the default duplicate checker
-        default_dedup_col = find_col(master_headers, "email") or find_col(master_headers, "linkedin") or master_headers[0]
-        dedup_column = st.selectbox(
-            "Select column to check duplicates on (e.g. Email or LinkedIn)",
-            options=master_headers,
-            index=master_headers.index(default_dedup_col)
-        )
-        keep_option = st.radio(
-            "Keep:",
-            options=["First occurrence", "Last occurrence"], index=0, horizontal=True
-        )
-        keep_value = "first" if keep_option == "First occurrence" else "last"
-        
-        # Deduplicate ignoring case
-        temp_key = dedup_df[dedup_column].astype(str).str.strip().str.lower()
-        dedup_df = dedup_df[~temp_key.duplicated(keep=keep_value)]
-        st.write(f"Removed **{len(master_df) - len(dedup_df)}** duplicates.")
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        dedup_df.to_excel(writer, index=False, sheet_name="Master")
+        master_df.to_excel(writer, index=False, sheet_name="Master")
     output.seek(0)
 
     st.download_button(
