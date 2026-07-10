@@ -64,7 +64,7 @@ if uploaded_files:
         with st.expander(f"Mapping for: {name}"):
             st.json(mapping)
 
-       aligned_dfs = []
+    aligned_dfs = []
     for df, mapping, name in zip(dataframes, mapping_per_file, file_names):
         renamed_df = df.rename(columns=mapping)
         
