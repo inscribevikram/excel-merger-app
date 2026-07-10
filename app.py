@@ -23,7 +23,8 @@ TARGET_KEYWORDS = [
 ]
 
 def normalize(col):
-    return str(col).strip().lower().replace("_", " ")
+    # Removes newlines, extra spaces, and common invisible characters
+    return str(col).replace('\n', ' ').strip().lower().replace("_", " ")
 
 def extract_clean_table(file):
     excel = pd.ExcelFile(file)
@@ -93,12 +94,21 @@ def map_headers(all_columns_list, threshold):
                 if "Email" not in master_headers:
                     master_headers.append("Email")
                 file_mapping[col] = "Email"
+            # Hardcode catch for "Tier" and "Priority Tier" (including those with \n)
+            elif "tier" in norm_col:
+                if "Tier" not in master_headers:
+                    master_headers.append("Tier")
+                file_mapping[col] = "Tier"
             elif match:
                 idx = [normalize(m) for m in master_headers].index(match[0])
                 file_mapping[col] = master_headers[idx]
             else:
-                master_headers.append(col)
-                file_mapping[col] = col
+                # Add the raw original header to the master list
+                # But strip out ugly formatting like newline characters
+                clean_header = str(col).replace('\n', ' ').strip()
+                if clean_header not in master_headers:
+                    master_headers.append(clean_header)
+                file_mapping[col] = clean_header
                 
         mapping_per_file.append(file_mapping)
         
@@ -126,18 +136,38 @@ if uploaded_files:
 
     master_df = pd.concat(aligned_dfs, ignore_index=True)
     
+    # --- DEDUPLICATION LOGIC (Before sorting) ---
+    st.subheader("🧹 Deduplication Settings")
+    dedup_enabled = st.checkbox("Remove duplicate leads", value=True)
+    
+    if dedup_enabled:
+        # Defaults to Organisation for deduping
+        if "Organisation" in master_df.columns:
+            dedup_col = "Organisation"
+        else:
+            dedup_col = master_headers[0]
+            
+        st.write(f"Removing duplicate leads based on **{dedup_col}**.")
+        
+        # Clean the key to ignore upper/lower case and spaces
+        temp_key = master_df[dedup_col].astype(str).str.strip().str.lower()
+        
+        # Store count before drop
+        before_count = len(master_df)
+        master_df = master_df[~temp_key.duplicated(keep="first")]
+        after_count = len(master_df)
+        
+        st.write(f"Removed **{before_count - after_count}** duplicates.")
+    
     # --- REORDER COLUMNS TO MATCH YOUR PREFERRED LAYOUT ---
-    # These columns will be forced to the front in this exact order
-    priority_cols = ["Tier", "Priority Tier", "Organisation", "Country", "Segment", "Decision Maker", "Role", "Linkedin", "Email"]
+    priority_cols = ["Tier", "Organisation", "Country", "Segment", "Decision Maker", "Role", "Linkedin", "Email"]
     final_cols = []
     
-    # Grab priority columns first if they exist
     for p_col in priority_cols:
         for actual_col in master_df.columns:
             if normalize(p_col) == normalize(actual_col) and actual_col not in final_cols:
                 final_cols.append(actual_col)
                 
-    # Grab the rest of the columns
     for col in master_df.columns:
         if col not in final_cols:
             final_cols.append(col)
@@ -155,7 +185,7 @@ if uploaded_files:
     st.download_button(
         label="📥 Download Smart Master File",
         data=output,
-        file_name="smart_master_file.xlsx",
+        file_name="smart_master_file_final.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 else:
